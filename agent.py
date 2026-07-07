@@ -17,19 +17,20 @@ Key design decisions
    (a) the LLM emits a final answer (no more tool calls), OR
    (b) all relevant tools have been called once (recursion_limit), OR
    (c) a malicious-intent action is attempted without prior HITL approval.
+
+4. Structured output: every tool call writes outputs/<tool>_<ts>.json;
+   the final response writes outputs/final_response_<ts>.json.
 """
 
 from __future__ import annotations
 
 import contextvars
+import datetime
 import json
 import os
+import pathlib
 from typing import Any
 
-# NOTE: load_dotenv() must run BEFORE we import tools.py, because tools.py
-# reads TOOL_MOCK_MODE at import time. Importing tools first would read
-# TOOL_MOCK_MODE before .env had a chance to set it, silently disabling
-# mock mode regardless of what's in the .env file.
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -40,36 +41,28 @@ from langgraph.prebuilt import create_react_agent
 from tools import TOOL_REGISTRY
 from httpx_parser import parse_httpx
 
-AGENT_ID    = "agent-striker"
-OLLAMA_URL  = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+AGENT_ID     = "agent-striker"
+OLLAMA_URL   = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3.5:0.8b")
+
+_OUTPUTS_DIR = pathlib.Path(__file__).parent / "outputs"
 
 # ── LLM client (Ollama OpenAI-compatible endpoint) ────────────────────────────
 
 llm = ChatOpenAI(
     model=OLLAMA_MODEL,
     base_url=OLLAMA_URL,
-    # Reads the real key from .env (OLLAMA_API_KEY). Falls back to the
-    # "ollama" placeholder only for local Ollama, which ignores the value
-    # entirely. Ollama Cloud DOES check this value, so it must be real.
     api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
     temperature=0,
 )
 
 # ── Per-request state (isolated via contextvars) ──────────────────────────────
-# Each entry: { tool, target, intent_is_malicious, reasoning, hitl_approved, output_summary }
-#
-# This used to be plain module-level globals (_action_log = [], _hitl_approved = set()).
-# That's unsafe once this runs as a real service: if two requests are being
-# handled around the same time, one request's HITL approvals and action log
-# could leak into another request's response. contextvars give each request
-# its own isolated copy automatically, including when FastAPI runs the request
-# in a worker thread (see main.py's sync endpoint change).
+
 _state_var: contextvars.ContextVar[dict] = contextvars.ContextVar("agent_state")
 
 
 def _reset_state() -> None:
-    _state_var.set({"action_log": [], "hitl_approved": set()})
+    _state_var.set({"action_log": [], "hitl_approved": set(), "skipped": []})
 
 
 def _get_state() -> dict:
@@ -94,9 +87,28 @@ def _log_action(
     })
 
 
+def _save_tool_output(tool: str, target: str, raw_output: str, parsed_findings: list) -> str:
+    """Write a structured JSON record for one tool run. Returns the file path."""
+    _OUTPUTS_DIR.mkdir(exist_ok=True)
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")[:19]  # seconds precision
+    mode = "mock" if os.getenv("TOOL_MOCK_MODE", "true").lower() == "true" else "real"
+    data = {
+        "tool": tool,
+        "target": target,
+        "raw_output": raw_output,
+        "parsed_findings": parsed_findings,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "mode": mode,
+    }
+    path = _OUTPUTS_DIR / f"{tool}_{ts}.json"
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+    return str(path)
+
+
 # ── HITL gate ─────────────────────────────────────────────────────────────────
 
-MOCK_HITL: bool = os.getenv("TOOL_MOCK_MODE", "false").lower() == "true"
+MOCK_HITL: bool = os.getenv("TOOL_MOCK_MODE", "true").lower() == "true"
 EXPLOIT_TOOLS = {"sqlmap", "xsstrike", "dalfox", "smuggler", "ssrfmap", "tplmap", "crlfuzzer"}
 
 
@@ -120,14 +132,13 @@ def hitl_approve(tool_name: str, target: str, reason: str) -> str:
         _log_action(
             tool_name=f"hitl_approve({tool_name})",
             target=target,
-            intent_is_malicious=True,   # requesting approval to run exploit = malicious intent
+            intent_is_malicious=True,
             reasoning=reason,
             output_summary=f"APPROVED (mock): {tool_name} cleared on {target}",
             hitl_approved=True,
         )
         return f"APPROVED: {tool_name} is cleared to run on {target}. Proceed."
     else:
-        # Real mode: block and wait for terminal input
         print(f"\n[HITL REQUIRED] Agent wants to run: {tool_name}")
         print(f"  Target  : {target}")
         print(f"  Reason  : {reason}")
@@ -156,7 +167,6 @@ def hitl_approve(tool_name: str, target: str, reason: str) -> str:
 
 
 def _check_hitl(tool_name: str, target: str) -> str | None:
-    """Return an error string if tool_name requires HITL but hasn't been approved."""
     if tool_name in EXPLOIT_TOOLS:
         key = f"{tool_name}:{target}"
         if key not in _get_state()["hitl_approved"]:
@@ -176,7 +186,16 @@ def run_httpx(target: str) -> str:
     Intent: reconnaissance only — not malicious.
     Always run this first to confirm the target is reachable.
     """
-    raw = TOOL_REGISTRY["httpx"]().run(target)
+    try:
+        raw = TOOL_REGISTRY["httpx"]().run(target)
+    except RuntimeError as exc:
+        msg = f"[SKIPPED] httpx: {exc}"
+        print(f"[WARN] {msg}")
+        _get_state()["skipped"].append({"tool": "httpx", "target": target, "error": str(exc)})
+        _save_tool_output("httpx", target, str(exc), [])
+        _log_action("httpx", target, False, "Tool unavailable.", msg)
+        return msg
+
     parsed = parse_httpx(raw, target)
     _log_action(
         tool_name="httpx",
@@ -185,6 +204,7 @@ def run_httpx(target: str) -> str:
         reasoning="Verify target liveness and basic tech stack before exploitation.",
         output_summary=parsed["semantic_summary"] or raw[:300],
     )
+    _save_tool_output("httpx", target, raw, [parsed])
     signals = parsed["signal_candidates"] or ["none detected"]
     return f"httpx output: {raw}\nsignals detected: {signals}"
 
@@ -202,7 +222,16 @@ def run_sqlmap(target: str, param: str = "") -> str:
     blocked = _check_hitl("sqlmap", target)
     if blocked:
         return blocked
-    raw = TOOL_REGISTRY["sqlmap"]().run(target, param=param)
+    try:
+        raw = TOOL_REGISTRY["sqlmap"]().run(target, param=param)
+    except RuntimeError as exc:
+        msg = f"[SKIPPED] sqlmap: {exc}"
+        print(f"[WARN] {msg}")
+        _get_state()["skipped"].append({"tool": "sqlmap", "target": target, "error": str(exc)})
+        _save_tool_output("sqlmap", target, str(exc), [])
+        _log_action("sqlmap", target, True, "Tool unavailable.", msg, hitl_approved=True)
+        return msg
+
     _log_action(
         tool_name="sqlmap",
         target=target,
@@ -211,6 +240,7 @@ def run_sqlmap(target: str, param: str = "") -> str:
         output_summary=raw[:300],
         hitl_approved=True,
     )
+    _save_tool_output("sqlmap", target, raw, [])
     return f"sqlmap output: {raw}"
 
 
@@ -223,7 +253,16 @@ def run_xsstrike(target: str) -> str:
     blocked = _check_hitl("xsstrike", target)
     if blocked:
         return blocked
-    raw = TOOL_REGISTRY["xsstrike"]().run(target)
+    try:
+        raw = TOOL_REGISTRY["xsstrike"]().run(target)
+    except RuntimeError as exc:
+        msg = f"[SKIPPED] xsstrike: {exc}"
+        print(f"[WARN] {msg}")
+        _get_state()["skipped"].append({"tool": "xsstrike", "target": target, "error": str(exc)})
+        _save_tool_output("xsstrike", target, str(exc), [])
+        _log_action("xsstrike", target, True, "Tool unavailable.", msg, hitl_approved=True)
+        return msg
+
     _log_action(
         tool_name="xsstrike",
         target=target,
@@ -232,6 +271,7 @@ def run_xsstrike(target: str) -> str:
         output_summary=raw[:300],
         hitl_approved=True,
     )
+    _save_tool_output("xsstrike", target, raw, [])
     return f"xsstrike output: {raw}"
 
 
@@ -244,7 +284,16 @@ def run_dalfox(target: str) -> str:
     blocked = _check_hitl("dalfox", target)
     if blocked:
         return blocked
-    raw = TOOL_REGISTRY["dalfox"]().run(target)
+    try:
+        raw = TOOL_REGISTRY["dalfox"]().run(target)
+    except RuntimeError as exc:
+        msg = f"[SKIPPED] dalfox: {exc}"
+        print(f"[WARN] {msg}")
+        _get_state()["skipped"].append({"tool": "dalfox", "target": target, "error": str(exc)})
+        _save_tool_output("dalfox", target, str(exc), [])
+        _log_action("dalfox", target, True, "Tool unavailable.", msg, hitl_approved=True)
+        return msg
+
     _log_action(
         tool_name="dalfox",
         target=target,
@@ -253,6 +302,7 @@ def run_dalfox(target: str) -> str:
         output_summary=raw[:300],
         hitl_approved=True,
     )
+    _save_tool_output("dalfox", target, raw, [])
     return f"dalfox output: {raw}"
 
 
@@ -265,7 +315,16 @@ def run_smuggler(target: str) -> str:
     blocked = _check_hitl("smuggler", target)
     if blocked:
         return blocked
-    raw = TOOL_REGISTRY["smuggler"]().run(target)
+    try:
+        raw = TOOL_REGISTRY["smuggler"]().run(target)
+    except RuntimeError as exc:
+        msg = f"[SKIPPED] smuggler: {exc}"
+        print(f"[WARN] {msg}")
+        _get_state()["skipped"].append({"tool": "smuggler", "target": target, "error": str(exc)})
+        _save_tool_output("smuggler", target, str(exc), [])
+        _log_action("smuggler", target, True, "Tool unavailable.", msg, hitl_approved=True)
+        return msg
+
     _log_action(
         tool_name="smuggler",
         target=target,
@@ -274,6 +333,7 @@ def run_smuggler(target: str) -> str:
         output_summary=raw[:300],
         hitl_approved=True,
     )
+    _save_tool_output("smuggler", target, raw, [])
     return f"smuggler output: {raw}"
 
 
@@ -286,14 +346,22 @@ def run_ssrfmap(target: str, param: str = "") -> str:
     Args:
         target: Full URL including query string.
         param:  The exact query parameter name to fuzz for SSRF (e.g. "url",
-                "redirect", "file"). Use the parameter name flagged by the
-                Prober context. If omitted, the first query parameter found
-                in the URL is used, which may not be the correct one.
+                "redirect", "file"). If omitted, the first query parameter found
+                in the URL is used.
     """
     blocked = _check_hitl("ssrfmap", target)
     if blocked:
         return blocked
-    raw = TOOL_REGISTRY["ssrfmap"]().run(target, param=param)
+    try:
+        raw = TOOL_REGISTRY["ssrfmap"]().run(target, param=param)
+    except RuntimeError as exc:
+        msg = f"[SKIPPED] ssrfmap: {exc}"
+        print(f"[WARN] {msg}")
+        _get_state()["skipped"].append({"tool": "ssrfmap", "target": target, "error": str(exc)})
+        _save_tool_output("ssrfmap", target, str(exc), [])
+        _log_action("ssrfmap", target, True, "Tool unavailable.", msg, hitl_approved=True)
+        return msg
+
     _log_action(
         tool_name="ssrfmap",
         target=target,
@@ -302,6 +370,7 @@ def run_ssrfmap(target: str, param: str = "") -> str:
         output_summary=raw[:300],
         hitl_approved=True,
     )
+    _save_tool_output("ssrfmap", target, raw, [])
     return f"ssrfmap output: {raw}"
 
 
@@ -314,7 +383,16 @@ def run_tplmap(target: str) -> str:
     blocked = _check_hitl("tplmap", target)
     if blocked:
         return blocked
-    raw = TOOL_REGISTRY["tplmap"]().run(target)
+    try:
+        raw = TOOL_REGISTRY["tplmap"]().run(target)
+    except RuntimeError as exc:
+        msg = f"[SKIPPED] tplmap: {exc}"
+        print(f"[WARN] {msg}")
+        _get_state()["skipped"].append({"tool": "tplmap", "target": target, "error": str(exc)})
+        _save_tool_output("tplmap", target, str(exc), [])
+        _log_action("tplmap", target, True, "Tool unavailable.", msg, hitl_approved=True)
+        return msg
+
     _log_action(
         tool_name="tplmap",
         target=target,
@@ -323,6 +401,7 @@ def run_tplmap(target: str) -> str:
         output_summary=raw[:300],
         hitl_approved=True,
     )
+    _save_tool_output("tplmap", target, raw, [])
     return f"tplmap output: {raw}"
 
 
@@ -335,7 +414,16 @@ def run_crlfuzzer(target: str) -> str:
     blocked = _check_hitl("crlfuzzer", target)
     if blocked:
         return blocked
-    raw = TOOL_REGISTRY["crlfuzzer"]().run(target)
+    try:
+        raw = TOOL_REGISTRY["crlfuzzer"]().run(target)
+    except RuntimeError as exc:
+        msg = f"[SKIPPED] crlfuzzer: {exc}"
+        print(f"[WARN] {msg}")
+        _get_state()["skipped"].append({"tool": "crlfuzzer", "target": target, "error": str(exc)})
+        _save_tool_output("crlfuzzer", target, str(exc), [])
+        _log_action("crlfuzzer", target, True, "Tool unavailable.", msg, hitl_approved=True)
+        return msg
+
     _log_action(
         tool_name="crlfuzzer",
         target=target,
@@ -344,6 +432,7 @@ def run_crlfuzzer(target: str) -> str:
         output_summary=raw[:300],
         hitl_approved=True,
     )
+    _save_tool_output("crlfuzzer", target, raw, [])
     return f"crlfuzzer output: {raw}"
 
 
@@ -374,12 +463,13 @@ def run_react_agent(prompt: str, target: str, context: dict) -> dict:
     Every tool call is recorded in action_log with intent_is_malicious bool,
     which is used by the loop to detect unapproved malicious actions and by
     the caller to audit the full decision chain.
+
+    Writes outputs/final_response_<ts>.json with the full findings list.
     """
     _reset_state()
 
     agent = create_react_agent(llm, TOOLS)
 
-    # Build the full prompt including upstream context
     context_summary = json.dumps(context, indent=2) if context else "No upstream context provided."
 
     full_prompt = f"""You are agent-striker, a security exploitation validation agent.
@@ -408,14 +498,15 @@ Do not run tools on endpoints not mentioned in the context.
     try:
         result = agent.invoke(
             {"messages": [("user", full_prompt)]},
-            config={"recursion_limit": 20},  # cap total steps to prevent infinite loop
+            config={"recursion_limit": 20},
         )
         final_message = result["messages"][-1].content
     except Exception as exc:
         final_message = f"Agent loop error: {str(exc)}"
 
-    # Extract confirmed findings from the action log
     action_log = _get_state()["action_log"]
+    skipped = _get_state()["skipped"]
+
     findings = []
     for entry in action_log:
         if entry["intent_is_malicious"] and entry["hitl_approved"] and entry["tool"] != "hitl_approve":
@@ -423,16 +514,23 @@ Do not run tools on endpoints not mentioned in the context.
                 "tool":    entry["tool"],
                 "target":  entry["target"],
                 "summary": entry["output_summary"],
+                "status":  "completed",
             })
+    for s in skipped:
+        findings.append({
+            "tool":    s["tool"],
+            "target":  s["target"],
+            "summary": f"SKIPPED: {s['error']}",
+            "status":  "skipped",
+        })
 
-    # Termination check: were any malicious actions attempted without approval?
     unapproved = [
         e for e in action_log
         if e["intent_is_malicious"] and not e["hitl_approved"]
         and not e["tool"].startswith("hitl_approve")
     ]
 
-    return {
+    response = {
         "agent_id": AGENT_ID,
         "status": "completed" if not unapproved else "blocked",
         "response": {
@@ -442,3 +540,15 @@ Do not run tools on endpoints not mentioned in the context.
             "action_log": action_log.copy(),
         },
     }
+
+    # Write final response to outputs/
+    try:
+        _OUTPUTS_DIR.mkdir(exist_ok=True)
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        final_path = _OUTPUTS_DIR / f"final_response_{ts}.json"
+        with open(final_path, "w") as f:
+            json.dump(response, f, indent=2)
+    except Exception as exc:
+        print(f"[WARN] Could not write final response file: {exc}")
+
+    return response

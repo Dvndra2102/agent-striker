@@ -6,6 +6,8 @@ Endpoints:
 """
 
 import os
+import urllib.request
+import urllib.error
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -17,7 +19,6 @@ load_dotenv()
 AGENT_ID = "agent-striker"
 VERSION  = "1.0.0"
 
-# Tools this agent is permitted to call (enforced inside agent.py as well)
 TOOL_ALLOWLIST = [
     "httpx",
     "sqlmap",
@@ -28,6 +29,34 @@ TOOL_ALLOWLIST = [
     "tplmap",
     "crlfuzzer",
 ]
+
+
+def _check_environment() -> None:
+    """Print startup warnings for missing or unreachable config."""
+    mock_mode = os.getenv("TOOL_MOCK_MODE", "true").lower()
+    if mock_mode not in ("true", "false"):
+        print(f"[WARN] TOOL_MOCK_MODE={mock_mode!r} is not 'true' or 'false' — defaulting to true")
+
+    api_key = os.getenv("OLLAMA_API_KEY", "")
+    if not api_key or api_key in ("ollama", "changeme"):
+        print("[WARN] OLLAMA_API_KEY is not set or is a placeholder — Ollama Cloud requests will fail")
+
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
+    try:
+        req = urllib.request.Request(
+            f"{base_url}/models",
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+        )
+        with urllib.request.urlopen(req, timeout=4):
+            print(f"[OK]   Ollama endpoint reachable: {base_url}")
+    except Exception as exc:
+        print(f"[WARN] Ollama endpoint unreachable ({base_url}): {exc}")
+
+    mode_label = "MOCK" if mock_mode == "true" else "REAL"
+    print(f"[OK]   agent-striker v{VERSION} starting — tool mode: {mode_label}")
+
+
+_check_environment()
 
 app = FastAPI(title="agent-striker", version=VERSION)
 
@@ -40,13 +69,9 @@ class TaskRequest(BaseModel):
 
 @app.post("/agents/{agent_id}/tasks")
 def run_task(agent_id: str, req: TaskRequest):
-    # Deliberately a sync "def", not "async def": run_react_agent() is a slow,
-    # blocking call (LLM round-trips, subprocess calls in real mode, and even
-    # input() in real HITL mode). If this were "async def", that blocking call
-    # would freeze FastAPI's single event loop, and every other request
-    # (including /health) would hang until this one finished. A sync def lets
-    # FastAPI hand it to a background thread automatically, so the server
-    # can serve other requests concurrently.
+    # Deliberately sync (not async): run_react_agent is blocking (LLM round-trips,
+    # subprocess calls). A sync def lets FastAPI run it in a background thread so
+    # the event loop stays free for other requests (including /health).
     if agent_id != AGENT_ID:
         raise HTTPException(status_code=404, detail=f"Unknown agent: {agent_id}")
     try:
@@ -76,5 +101,5 @@ async def health():
         "status": "ok",
         "version": VERSION,
         "tool_allowlist": TOOL_ALLOWLIST,
-        "mock_mode": os.getenv("TOOL_MOCK_MODE", "false").lower() == "true",
+        "mock_mode": os.getenv("TOOL_MOCK_MODE", "true").lower() == "true",
     }
