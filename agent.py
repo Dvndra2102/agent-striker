@@ -87,6 +87,29 @@ def _log_action(
     })
 
 
+def _strip_markdown(text: str) -> str:
+    """Remove markdown formatting so summary fields contain plain prose."""
+    import re
+    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)   # **bold**, *italic*, ***both***
+    text = re.sub(r'`[^`]*`', lambda m: m.group(0)[1:-1], text)  # `inline code`
+    text = re.sub(r'^\s*#{1,6}\s+', '', text, flags=re.MULTILINE)  # ## headings
+    text = re.sub(r'^\s*[-*+]\s+', '', text, flags=re.MULTILINE)   # bullet points
+    text = re.sub(r'^\|.*\|$', '', text, flags=re.MULTILINE)        # | table | rows |
+    text = re.sub(r'^\s*[-|: ]+$', '', text, flags=re.MULTILINE)    # table separator lines
+    text = re.sub(r'\n{3,}', '\n\n', text)                          # collapse excess blank lines
+    return text.strip()
+
+
+def _strip_banner_lines(text: str) -> str:
+    """Remove sqlmap ASCII-art banner lines (pure dashes, brackets, pipes, whitespace)."""
+    import re
+    clean = [
+        line for line in text.splitlines()
+        if re.search(r'[a-zA-Z0-9]', line)  # keep only lines that contain a real word character
+    ]
+    return '\n'.join(clean)
+
+
 def _save_tool_output(tool: str, target: str, raw_output: str, parsed_findings: list) -> str:
     """Write a structured JSON record for one tool run. Returns the file path."""
     _OUTPUTS_DIR.mkdir(exist_ok=True)
@@ -237,7 +260,7 @@ def run_sqlmap(target: str, param: str = "") -> str:
         target=target,
         intent_is_malicious=True,
         reasoning="Validate SQL injection on identified injectable parameter.",
-        output_summary=raw[:300],
+        output_summary=_strip_banner_lines(raw)[:500],
         hitl_approved=True,
     )
     _save_tool_output("sqlmap", target, raw, [])
@@ -500,7 +523,7 @@ Do not run tools on endpoints not mentioned in the context.
             {"messages": [("user", full_prompt)]},
             config={"recursion_limit": 20},
         )
-        final_message = result["messages"][-1].content
+        final_message = _strip_markdown(result["messages"][-1].content)
     except Exception as exc:
         final_message = f"Agent loop error: {str(exc)}"
 
